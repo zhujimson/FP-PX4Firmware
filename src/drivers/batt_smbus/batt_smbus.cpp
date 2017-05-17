@@ -77,14 +77,20 @@
 #include <drivers/drv_batt_smbus.h>
 #include <drivers/device/ringbuffer.h>
 
+//  For BMSPOW smart battery.
+#include <../../../../../ArduCopter/APM_Config.h>
+
+
 #define BATT_SMBUS_ADDR_MIN			0x08	///< lowest possible address
 #define BATT_SMBUS_ADDR_MAX			0x7F	///< highest possible address
 
 #define BATT_SMBUS_I2C_BUS			PX4_I2C_BUS_EXPANSION
-#define BATT_SMBUS_ADDR				0x0B	///< I2C address
+
+#define BATT_SMBUS_ADDR				0x0B	///< I2C address,SMBUS的通用7位地址，8位的话时16和17
+
 #define BATT_SMBUS_TEMP				0x08	///< temperature register
 #define BATT_SMBUS_VOLTAGE			0x09	///< voltage register
-#define BATT_SMBUS_REMAINING_CAPACITY	0x0f	///< predicted remaining battery capacity as a percentage
+#define BATT_SMBUS_REMAINING_CAPACITY	0x0f	///< predicted remaining battery capacity
 #define BATT_SMBUS_FULL_CHARGE_CAPACITY 0x10    ///< capacity when fully charged
 #define BATT_SMBUS_DESIGN_CAPACITY		0x18	///< design capacity register
 #define BATT_SMBUS_DESIGN_VOLTAGE		0x19	///< design voltage register
@@ -92,7 +98,18 @@
 #define BATT_SMBUS_MANUFACTURE_NAME		0x20	///< manufacturer name
 #define BATT_SMBUS_MANUFACTURE_DATA		0x23	///< manufacturer data
 #define BATT_SMBUS_MANUFACTURE_INFO		0x25	///< cell voltage register
-#define BATT_SMBUS_CURRENT			0x2a	///< current register
+
+#ifdef SMBUS_BMSPOW
+#define BATT_SMBUS_CURRENT		0x0a                            //读register的地址
+#define BATT_SMBUS_CELL1        0x3f
+#define BATT_SMBUS_CELL2        0x3e
+#define BATT_SMBUS_CELL3        0x3d
+#define BATT_SMBUS_CELL4        0x3c
+#define BATT_CYCLE_COUNT        0x17
+#else
+#define BATT_SMBUS_CURRENT		0x2a	///< current register   //读block的寄存器地址
+#endif
+
 #define BATT_SMBUS_MEASUREMENT_INTERVAL_US	(1000000 / 10)	///< time in microseconds, measure at 10hz
 #define BATT_SMBUS_TIMEOUT_US		10000000	///< timeout looking for battery 10seconds after startup
 #define BATT_SMBUS_BUTTON_DEBOUNCE_MS  300             ///< button holds longer than this time will cause a power off event
@@ -168,6 +185,10 @@ private:
 	 */
 	int			read_reg(uint8_t reg, uint16_t &val);
 
+#ifdef  SMBUS_BMSPOW
+    int         read_current_reg(uint8_t reg, int16_t &val);
+#endif
+
 	/**
 	 * Read block from bus
 	 * @return returns number of characters read if successful, zero if unsuccessful
@@ -232,6 +253,8 @@ BATT_SMBUS::~BATT_SMBUS()
 int
 BATT_SMBUS::init()
 {
+    warnx("\n smbus init()");
+
 	int ret = ENOTTY;
 
 	// attempt to initialise I2C bus
@@ -313,9 +336,13 @@ BATT_SMBUS::test()
 	return OK;
 }
 
+
+// Search()只有当SMBUS主函数main发出search指令才执行，一般是不执行
 int
 BATT_SMBUS::search()
 {
+    warnx("\n SMBUS search()");
+
 	bool found_slave = false;
 	uint16_t tmp;
 	int16_t orig_addr = get_address();
@@ -333,7 +360,7 @@ BATT_SMBUS::search()
 		usleep(1);
 	}
 
-	// restore original i2c address
+	// restore original i2c address, 重置IIC的地址为原来的地址
 	set_address(orig_addr);
 
 	// display completion message
@@ -381,6 +408,7 @@ BATT_SMBUS::cycle_trampoline(void *arg)
 void
 BATT_SMBUS::cycle()
 {
+    warnx("\n SMBUS cycle()");
 	// get current time
 	uint64_t now = hrt_absolute_time();
 
@@ -396,7 +424,7 @@ BATT_SMBUS::cycle()
 	// set time of reading
 	new_report.timestamp = now;
 
-	// read voltage
+	// 定义一个暂存变量
 	uint16_t tmp;
 
 	if (read_reg(BATT_SMBUS_VOLTAGE, tmp) == OK) {
@@ -405,18 +433,67 @@ BATT_SMBUS::cycle()
 
 		// convert millivolts to volts
 		new_report.voltage_v = ((float)tmp) / 1000.0f;
+        warnx("\n VOLTAGE:%.4f V",(float)new_report.voltage_v);
 
-		// read current
-		uint8_t buff[6];
+		uint8_t buff[6];    //为后面使用read_block()函数预备一个数组
 
-		if (read_block(BATT_SMBUS_CURRENT, buff, 4, false) == 4) {
+#ifdef  SMBUS_BMSPOW     //  For BMSPOW smart battery.
+        // full charge capacity
+        if(read_reg(BATT_SMBUS_FULL_CHARGE_CAPACITY,tmp) == OK){
+            new_report.fullcharge_mah = ((float)tmp);
+            warnx("\n fullcharge mah:%.4f mAh",new_report.fullcharge_mah);  // 打印充满的电量毫安数
+        }
+
+        // read cycle
+        if(read_reg(BATT_CYCLE_COUNT,tmp) == OK){
+            new_report.cycle_count = ((float)tmp);
+            warnx("\n cycle_count:%.4f ",(float)new_report.cycle_count);
+        }
+
+        // read cells
+        if(read_reg(BATT_SMBUS_CELL1,tmp) == OK){
+            new_report.cell1_voltage_v = ((float)tmp);
+            warnx("\n cell1_voltage:%.4f V",(float)new_report.cell1_voltage_v);
+        }
+        if(read_reg(BATT_SMBUS_CELL2,tmp) == OK){
+            new_report.cell2_voltage_v = ((float)tmp);
+            warnx("\n cell2_voltage:%.4f V",(float)new_report.cell2_voltage_v);
+        }
+        if(read_reg(BATT_SMBUS_CELL3,tmp) == OK){
+            new_report.cell3_voltage_v = ((float)tmp);
+            warnx("\n cell3_voltage:%.4f V",(float)new_report.cell3_voltage_v);
+        }
+        if(read_reg(BATT_SMBUS_CELL4,tmp) == OK){
+            new_report.cell4_voltage_v = ((float)tmp);
+            warnx("\n cell4_voltage:%.4f V",(float)new_report.cell4_voltage_v);
+        }
+
+        // read temperature
+        if(read_reg(BATT_SMBUS_TEMP,tmp) == OK){
+            new_report.temperature_c = ((float)tmp) / 10 - 273.15f;  //单位是摄氏度，从开氏温度转换过来
+            //new_report.temperature_c = 27.000f;
+        }
+        // read current
+        int16_t tmp_current;
+        if(read_current_reg(BATT_SMBUS_CURRENT, tmp_current) == OK){
+            new_report.current_a = ((float)tmp_current) / 1000.0f;     // 单位是A
+            warnx("\n read_reg CURRENT:%.4f A",(float)new_report.current_a);
+        }
+#else
+		if(read_block(BATT_SMBUS_CURRENT, buff, 4, false) == 4) {
 			new_report.current_a = -(float)((int32_t)((uint32_t)buff[3] << 24 | (uint32_t)buff[2] << 16 | (uint32_t)buff[1] << 8 |
-							(uint32_t)buff[0])) / 1000.0f;
+							(uint32_t)buff[0])) / 1000.0f;      // 单位是A
+            //warnx("\n read_block CURRENT:%.4f A",(float)new_report.current_a);
 		}
+#endif
 
 		// read battery design capacity
 		if (_batt_capacity == 0) {
+#ifdef SMBUS_BMSPOW
+            if (read_reg(BATT_SMBUS_DESIGN_CAPACITY, tmp) == OK) {
+#else
 			if (read_reg(BATT_SMBUS_FULL_CHARGE_CAPACITY, tmp) == OK) {
+#endif
 				_batt_capacity = tmp;
 			}
 		}
@@ -424,8 +501,12 @@ BATT_SMBUS::cycle()
 		// read remaining capacity
 		if (_batt_capacity > 0) {
 			if (read_reg(BATT_SMBUS_REMAINING_CAPACITY, tmp) == OK) {
+#ifdef SMBUS_BMSPOW
+                new_report.remaining_mah = tmp;
+                warnx("\n remaining capacity:%.4f mAh",(float)tmp);               // 打印剩余的毫安数
+#endif
 				if (tmp < _batt_capacity) {
-					new_report.discharged_mah = _batt_capacity - tmp;
+					new_report.discharged_mah = _batt_capacity - tmp;           // 消耗的毫安时
 				}
 			}
 		}
@@ -454,7 +535,7 @@ BATT_SMBUS::cycle()
 			}
 		}
 
-		// publish to orb
+		// publish to orb   //电池主题消息发布
 		if (_batt_topic != nullptr) {
 			orb_publish(_batt_orb_id, _batt_topic, &new_report);
 
@@ -497,7 +578,7 @@ BATT_SMBUS::read_reg(uint8_t reg, uint16_t &val)
 		uint8_t pec = get_PEC(reg, true, buff, 2);
 
 		if (pec == buff[2]) {
-			val = (uint16_t)buff[1] << 8 | (uint16_t)buff[0];
+			val = (uint16_t)buff[1] << 8 | (uint16_t)buff[0];  //高位后发，所以是buff1左移8位
 
 		} else {
 			ret = ENOTTY;
@@ -507,6 +588,32 @@ BATT_SMBUS::read_reg(uint8_t reg, uint16_t &val)
 	// return success or failure
 	return ret;
 }
+
+#ifdef SMBUS_BMSPOW
+int
+BATT_SMBUS::read_current_reg(uint8_t reg, int16_t &val)
+{
+	uint8_t buff[3];	// 2 bytes of data + PEC
+
+	// read from register
+	int ret = transfer(&reg, 1, buff, 3);
+
+	if (ret == OK) {
+		// check PEC
+		uint8_t pec = get_PEC(reg, true, buff, 2);
+
+		if (pec == buff[2]) {
+			val = (uint16_t)buff[1] << 8 | (uint16_t)buff[0];  //高位后发，所以是buff1左移8位
+            //warnx("\n curren buff[1] : %d",buff[1]);
+            //warnx("\n curren buff[0] : %d",buff[0]);
+		} else {
+			ret = ENOTTY;
+		}
+	}
+	// return success or failure
+	return ret;
+}
+#endif
 
 uint8_t
 BATT_SMBUS::read_block(uint8_t reg, uint8_t *data, uint8_t max_len, bool append_zero)
@@ -601,8 +708,10 @@ batt_smbus_usage()
 }
 
 int
-batt_smbus_main(int argc, char *argv[])
+batt_smbus_main(int argc, char *argv[])     //在上层libraries的AP_Monitor中对这个main进行调用
 {
+    warnx("\n batt_smbus_main()");
+
 	int i2cdevice = BATT_SMBUS_I2C_BUS;
 	int batt_smbusadr = BATT_SMBUS_ADDR; // 7bit address
 
@@ -644,6 +753,7 @@ batt_smbus_main(int argc, char *argv[])
 				errx(1, "new failed");
 			}
 
+            warnx("\n smbus_main_init()");
 			if (OK != g_batt_smbus->init()) {
 				delete g_batt_smbus;
 				g_batt_smbus = nullptr;
